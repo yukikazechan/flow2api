@@ -32,4 +32,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["python", "-m", "src.main"]
+CMD ["python", "main.py"]
