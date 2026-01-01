@@ -58,6 +58,7 @@ auth.json
 cookies.json
 browser_sessions/
 browser_data/
+browser_data_*/
 
 # Temp/Test Scripts
 test_*.py
