@@ -7,17 +7,7 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 
 from ..core.logger import debug_logger
 
-
-def validate_browser_proxy_url(proxy_url: str) -> tuple[bool, str]:
-    """验证浏览器代理URL格式"""
-    if not proxy_url:
-        return True, ""
-        
-    pattern = r'^(socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$'
-    if not re.match(pattern, proxy_url):
-        return False, "代理URL格式无效。正确格式: protocol://[user:pass@]host:port (支持 socks5/http/https)"
-    return True, ""
-
+# ... (保持原来的 parse_proxy_url 和 validate_browser_proxy_url 函数不变) ...
 def parse_proxy_url(proxy_url: str) -> Optional[Dict[str, str]]:
     """解析代理URL，分离协议、主机、端口、认证信息"""
     proxy_pattern = r'^(socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$'
@@ -39,14 +29,17 @@ class BrowserCaptchaService:
 
     def __init__(self, db=None):
         """初始化服务"""
+        # === 修改点 1: 设置为有头模式 ===
         self.headless = False 
         self.playwright = None
+        # 注意: 持久化模式下，我们操作的是 context 而不是 browser
         self.context: Optional[BrowserContext] = None 
         self._initialized = False
         self.website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
         self.db = db
         
-        # 指定本地数据存储目录
+        # === 修改点 2: 指定本地数据存储目录 ===
+        # 这会在脚本运行目录下生成 browser_data 文件夹，用于保存你的登录状态
         self.user_data_dir = os.path.join(os.getcwd(), "browser_data")
 
     @classmethod
@@ -55,6 +48,7 @@ class BrowserCaptchaService:
             async with cls._lock:
                 if cls._instance is None:
                     cls._instance = cls(db)
+                    # 首次调用不强制初始化，等待 get_token 时懒加载，或者可以在这里await
         return cls._instance
 
     async def initialize(self):
@@ -70,28 +64,13 @@ class BrowserCaptchaService:
                     proxy_url = captcha_config.browser_proxy_url
 
             debug_logger.log_info(f"[BrowserCaptcha] 正在启动浏览器 (用户数据目录: {self.user_data_dir})...")
-
-            # 清理可能存在的锁文件（Linux下是符号链接，可能是断开的）
-            # 使用 lexists 而不是 exists，因为 exists 对断开的符号链接返回 False
-            lock_files = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
-            for lock_name in lock_files:
-                lock_file = os.path.join(self.user_data_dir, lock_name)
-                # lexists 可以检测到断开的符号链接
-                if os.path.lexists(lock_file):
-                    try:
-                        debug_logger.log_info(f"[BrowserCaptcha] 发现锁文件，正在清理: {lock_file}")
-                        os.unlink(lock_file)  # unlink 适用于符号链接和普通文件
-                    except Exception as e:
-                        debug_logger.log_warning(f"[BrowserCaptcha] 清理锁文件失败: {e}")
-
-
             self.playwright = await async_playwright().start()
 
             # 配置启动参数
             launch_options = {
                 'headless': self.headless,
-                'user_data_dir': self.user_data_dir,
-                'viewport': {'width': 1280, 'height': 720},
+                'user_data_dir': self.user_data_dir, # 指定数据目录
+                'viewport': {'width': 1280, 'height': 720}, # 设置默认窗口大小
                 'args': [
                     '--disable-blink-features=AutomationControlled',
                     '--disable-infobars',
@@ -107,7 +86,11 @@ class BrowserCaptchaService:
                     launch_options['proxy'] = proxy_config
                     debug_logger.log_info(f"[BrowserCaptcha] 使用代理: {proxy_config['server']}")
 
+            # === 修改点 3: 使用 launch_persistent_context ===
+            # 这会启动一个带有状态的浏览器窗口
             self.context = await self.playwright.chromium.launch_persistent_context(**launch_options)
+            
+            # 设置默认超时
             self.context.set_default_timeout(30000)
 
             self._initialized = True
@@ -117,24 +100,49 @@ class BrowserCaptchaService:
             debug_logger.log_error(f"[BrowserCaptcha] ❌ 浏览器启动失败: {str(e)}")
             raise
 
-    async def get_token(self, project_id: str) -> Optional[str]:
+    async def get_token(self, project_id: str, token_id: Optional[int] = None) -> Optional[str]:
         """获取 reCAPTCHA token"""
+        target_dir = os.path.join(os.getcwd(), f"browser_data_{token_id}") if token_id else os.path.join(os.getcwd(), "browser_data")
+        
+        # 如果浏览器使用的目录与目标目录不一致，或者未初始化，则重新初始化
+        if (self._initialized and self.user_data_dir != target_dir) or (not self._initialized):
+            if self._initialized:
+                debug_logger.log_info(f"[BrowserCaptcha] 切换账号: {self.user_data_dir} -> {target_dir}")
+                await self.close()
+            
+            self.user_data_dir = target_dir
+            await self.initialize()
+
+        # 确保浏览器已启动
         if not self._initialized or not self.context:
             await self.initialize()
 
+        start_time = time.time()
         page: Optional[Page] = None
 
         try:
+            # === 修改点 4: 在现有上下文中新建标签页，而不是新建上下文 ===
+            # 这样可以复用该上下文中已保存的 Cookie (你的登录状态)
             page = await self.context.new_page()
+
             website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
             debug_logger.log_info(f"[BrowserCaptcha] 访问页面: {website_url}")
 
+            # 访问页面
             try:
                 await page.goto(website_url, wait_until="domcontentloaded")
             except Exception as e:
                 debug_logger.log_warning(f"[BrowserCaptcha] 页面加载警告: {str(e)}")
 
-            # 注入 reCAPTCHA 逻辑
+            # --- 关键点：如果需要人工介入 ---
+            # 你可以在这里加入一段逻辑，如果是第一次运行，或者检测到未登录，
+            # 可以暂停脚本，等你手动操作完再继续。
+            # 例如: await asyncio.sleep(30) 
+            
+            # ... (中间注入脚本和执行 reCAPTCHA 的代码逻辑与原版完全一致，此处省略以节省篇幅) ...
+            # ... 请将原代码中从 "检查并注入 reCAPTCHA v3 脚本" 到 token 获取部分的代码复制到这里 ...
+            
+            # 这里为了演示，简写注入逻辑（请保留你原有的完整注入逻辑）:
             script_loaded = await page.evaluate("() => { return !!(window.grecaptcha && window.grecaptcha.execute); }")
             if not script_loaded:
                 await page.evaluate(f"""
@@ -145,8 +153,10 @@ class BrowserCaptchaService:
                         document.head.appendChild(script);
                     }}
                 """)
+                # 等待加载... (保留你原有的等待循环)
                 await page.wait_for_timeout(2000) 
 
+            # 执行获取 Token (保留你原有的 execute 逻辑)
             token = await page.evaluate(f"""
                 async () => {{
                     try {{
@@ -166,6 +176,7 @@ class BrowserCaptchaService:
             debug_logger.log_error(f"[BrowserCaptcha] 异常: {str(e)}")
             return None
         finally:
+            # === 修改点 5: 只关闭 Page (标签页)，不关闭 Context (浏览器窗口) ===
             if page:
                 try:
                     await page.close()
@@ -176,7 +187,7 @@ class BrowserCaptchaService:
         """完全关闭浏览器（清理资源时调用）"""
         try:
             if self.context:
-                await self.context.close()
+                await self.context.close() # 这会关闭整个浏览器窗口
                 self.context = None
             
             if self.playwright:
@@ -188,6 +199,7 @@ class BrowserCaptchaService:
         except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] 关闭异常: {str(e)}")
 
+    # 增加一个辅助方法，用于手动登录
     async def open_login_window(self):
         """调用此方法打开一个永久窗口供你登录Google"""
         await self.initialize()

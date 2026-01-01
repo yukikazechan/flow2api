@@ -15,7 +15,7 @@ host = "0.0.0.0"
 port = 8000
 
 [debug]
-enabled = false
+enabled = true
 log_requests = true
 log_responses = true
 mask_token = true
@@ -37,6 +37,6 @@ timeout = 7200  # 缓存超时时间(秒), 默认2小时
 base_url = ""   # 缓存文件访问的基础URL, 留空则使用服务器地址
 
 [captcha]
-captcha_method = "browser"  # 打码方式: yescaptcha 或 browser
+captcha_method = "personal"  # 打码方式: yescaptcha, browser 或 personal (有头持久化)
 yescaptcha_api_key = ""  # YesCaptcha API密钥
 yescaptcha_base_url = "https://api.yescaptcha.com"

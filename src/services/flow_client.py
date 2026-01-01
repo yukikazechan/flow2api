@@ -54,20 +54,10 @@ class FlowClient:
         if use_at and at_token:
             headers["authorization"] = f"Bearer {at_token}"
 
-        # 通用请求头 - 确保与浏览器一致
+        # 通用请求头
         headers.update({
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-            "sec-ch-ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-site",
-            "x-goog-api-client": "gl-js/ fire/10.1.0",
-            "Referer": "https://labs.google/",
-            "Origin": "https://labs.google",
-            "X-Goog-Authuser": "0"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
 
         # Log request
@@ -292,7 +282,8 @@ class FlowClient:
         prompt: str,
         model_name: str,
         aspect_ratio: str,
-        image_inputs: Optional[List[Dict]] = None
+        image_inputs: Optional[List[Dict]] = None,
+        token_id: Optional[int] = None
     ) -> dict:
         """生成图片(同步返回)
 
@@ -303,6 +294,7 @@ class FlowClient:
             model_name: GEM_PIX, GEM_PIX_2 或 IMAGEN_3_5
             aspect_ratio: 图片宽高比
             image_inputs: 参考图片列表(图生图时使用)
+            token_id: Token ID (用于多账号会话隔离)
 
         Returns:
             {
@@ -319,7 +311,7 @@ class FlowClient:
         url = f"{self.api_base_url}/projects/{project_id}/flowMedia:batchGenerateImages"
 
         # 获取 reCAPTCHA token
-        recaptcha_token = await self._get_recaptcha_token(project_id) or ""
+        recaptcha_token = await self._get_recaptcha_token(project_id, token_id) or ""
         session_id = self._generate_session_id()
 
         # 构建请求
@@ -686,83 +678,90 @@ class FlowClient:
     # ========== 辅助方法 ==========
 
     def _generate_session_id(self) -> str:
-        """生成sessionId: timestamp"""
-        return f"{int(time.time() * 1000)}"
+        """生成sessionId: ;timestamp"""
+        return f";{int(time.time() * 1000)}"
 
     def _generate_scene_id(self) -> str:
         """生成sceneId: UUID"""
         return str(uuid.uuid4())
 
-    async def _get_recaptcha_token(self, project_id: str) -> Optional[str]:
+    async def _get_recaptcha_token(self, project_id: str, token_id: Optional[int] = None) -> Optional[str]:
         """获取reCAPTCHA token - 支持两种方式"""
         captcha_method = config.captcha_method
 
-        # 浏览器打码
-        if captcha_method == "browser":
+        # 恒定浏览器打码
+        if captcha_method == "personal":
             try:
-                from .browser_captcha import BrowserCaptchaService
-                # 修复 Bug: BrowserCaptchaService 需要的是 Database 对象来获取配置，而不是 ProxyManager
-                db = self.proxy_manager.db
-                service = await BrowserCaptchaService.get_instance(db)
-                return await service.get_token(project_id)
+                from .browser_captcha_personal import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.proxy_manager.db)
+                return await service.get_token(project_id, token_id)
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Browser] error: {str(e)}")
                 return None
-
-        # YesCaptcha打码
-        client_key = config.yescaptcha_api_key
-        if not client_key:
-            debug_logger.log_info("[reCAPTCHA] API key not configured, skipping")
-            return None
-
-        website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-        website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
-        base_url = config.yescaptcha_base_url
-        page_action = "FLOW_GENERATION"
-
-        try:
-            async with AsyncSession() as session:
-                create_url = f"{base_url}/createTask"
-                create_data = {
-                    "clientKey": client_key,
-                    "task": {
-                        "websiteURL": website_url,
-                        "websiteKey": website_key,
-                        "type": "RecaptchaV3TaskProxylessM1",
-                        "pageAction": page_action
-                    }
-                }
-
-                result = await session.post(create_url, json=create_data, impersonate="chrome110")
-                result_json = result.json()
-                task_id = result_json.get('taskId')
-
-                debug_logger.log_info(f"[reCAPTCHA] created task_id: {task_id}")
-
-                if not task_id:
-                    return None
-
-                get_url = f"{base_url}/getTaskResult"
-                for i in range(40):
-                    get_data = {
-                        "clientKey": client_key,
-                        "taskId": task_id
-                    }
-                    result = await session.post(get_url, json=get_data, impersonate="chrome110")
-                    result_json = result.json()
-
-                    debug_logger.log_info(f"[reCAPTCHA] polling #{i+1}: {result_json}")
-
-                    solution = result_json.get('solution', {})
-                    response = solution.get('gRecaptchaResponse')
-
-                    if response:
-                        return response
-
-                    time.sleep(3)
-
+        # 无头浏览器打码
+        elif captcha_method == "browser":
+            try:
+                from .browser_captcha import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.proxy_manager.db)
+                return await service.get_token(project_id, token_id)
+            except Exception as e:
+                debug_logger.log_error(f"[reCAPTCHA Browser] error: {str(e)}")
+                return None
+        else:
+            # YesCaptcha打码
+            client_key = config.yescaptcha_api_key
+            if not client_key:
+                debug_logger.log_info("[reCAPTCHA] API key not configured, skipping")
                 return None
 
-        except Exception as e:
-            debug_logger.log_error(f"[reCAPTCHA] error: {str(e)}")
-            return None
+            website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
+            website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+            base_url = config.yescaptcha_base_url
+            page_action = "FLOW_GENERATION"
+
+            try:
+                async with AsyncSession() as session:
+                    create_url = f"{base_url}/createTask"
+                    create_data = {
+                        "clientKey": client_key,
+                        "task": {
+                            "websiteURL": website_url,
+                            "websiteKey": website_key,
+                            "type": "RecaptchaV3TaskProxylessM1",
+                            "pageAction": page_action
+                        }
+                    }
+
+                    result = await session.post(create_url, json=create_data, impersonate="chrome110")
+                    result_json = result.json()
+                    task_id = result_json.get('taskId')
+
+                    debug_logger.log_info(f"[reCAPTCHA] created task_id: {task_id}")
+
+                    if not task_id:
+                        return None
+
+                    get_url = f"{base_url}/getTaskResult"
+                    for i in range(40):
+                        get_data = {
+                            "clientKey": client_key,
+                            "taskId": task_id
+                        }
+                        result = await session.post(get_url, json=get_data, impersonate="chrome110")
+                        result_json = result.json()
+
+                        debug_logger.log_info(f"[reCAPTCHA] polling #{i+1}: {result_json}")
+
+                        solution = result_json.get('solution', {})
+                        response = solution.get('gRecaptchaResponse')
+
+                        if response:
+                            return response
+
+                        time.sleep(3)
+
+                    return None
+
+            except Exception as e:
+                debug_logger.log_error(f"[reCAPTCHA] error: {str(e)}")
+                return None

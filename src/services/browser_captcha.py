@@ -4,7 +4,9 @@
 """
 import asyncio
 import time
+import os
 import re
+import json
 from typing import Optional, Dict
 from playwright.async_api import async_playwright, Browser, BrowserContext
 try:
@@ -86,7 +88,7 @@ class BrowserCaptchaService:
 
     def __init__(self, db=None):
         """初始化服务（始终使用无头模式）"""
-        self.headless = False  # 始终无头
+        self.headless = False  # 强制有头模式查看打码过程
         self.playwright = None
         self.browser: Optional[Browser] = None
         self._initialized = False
@@ -168,6 +170,8 @@ class BrowserCaptchaService:
             # 使用 per-account session file
             from .session_manager import get_session_manager
             session_mgr = get_session_manager()
+            
+            debug_logger.log_info(f"[BrowserCaptcha] get_token called with token_id={token_id}")
             
             if token_id:
                 auth_path = session_mgr.get_session_path(token_id)
