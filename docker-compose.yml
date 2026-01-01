@@ -1,14 +1,15 @@
-version: '3.8'
-
 services:
   flow2api:
-    image: thesmallhancat/flow2api:latest
+    build: .
     container_name: flow2api
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
       - ./config/setting.toml:/app/config/setting.toml
+      - ./browser_sessions:/app/browser_sessions
+      - /tmp/.X11-unix:/tmp/.X11-unix
     environment:
       - PYTHONUNBUFFERED=1
+      - DISPLAY=:0
     restart: unless-stopped
