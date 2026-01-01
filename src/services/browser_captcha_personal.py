@@ -21,6 +21,14 @@ def parse_proxy_url(proxy_url: str) -> Optional[Dict[str, str]]:
         return proxy_config
     return None
 
+def validate_browser_proxy_url(proxy_url: str) -> tuple[bool, str]:
+    """验证浏览器代理URL格式"""
+    if not proxy_url:
+        return True, ""
+    if parse_proxy_url(proxy_url):
+        return True, ""
+    return False, "代理URL格式错误, 应为 protocol://[user:pass@]host:port"
+
 class BrowserCaptchaService:
     """浏览器自动化获取 reCAPTCHA token（持久化有头模式）"""
 
