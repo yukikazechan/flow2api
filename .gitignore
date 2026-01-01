@@ -52,3 +52,19 @@ logs.txt
 *.tmp
 *.bak
 *.cache
+
+# Session and Auth
+auth.json
+cookies.json
+browser_sessions/
+browser_data/
+
+# Temp/Test Scripts
+test_*.py
+verify_*.py
+migrate_*.py
+logs_*.txt
+*.txt
+*.json
+!package.json
+!composer.json

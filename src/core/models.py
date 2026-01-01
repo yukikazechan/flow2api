@@ -175,3 +175,10 @@ class ChatCompletionRequest(BaseModel):
     # Flow2API specific parameters
     image: Optional[str] = None  # Base64 encoded image (deprecated, use messages)
     video: Optional[str] = None  # Base64 encoded video (deprecated)
+
+class PluginConfig(BaseModel):
+    """Chrome extension plugin configuration"""
+    id: int = 1
+    connection_token: str = ""
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
