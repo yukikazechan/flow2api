@@ -7,6 +7,7 @@ import time
 import re
 from typing import Optional, Dict
 from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright_stealth import stealth
 
 from ..core.logger import debug_logger
 
@@ -82,7 +83,7 @@ class BrowserCaptchaService:
 
     def __init__(self, db=None):
         """初始化服务（始终使用无头模式）"""
-        self.headless = True  # 始终无头
+        self.headless = False  # 始终无头
         self.playwright = None
         self.browser: Optional[Browser] = None
         self._initialized = False
@@ -143,11 +144,12 @@ class BrowserCaptchaService:
             debug_logger.log_error(f"[BrowserCaptcha] ❌ 浏览器启动失败: {str(e)}")
             raise
 
-    async def get_token(self, project_id: str) -> Optional[str]:
+    async def get_token(self, project_id: str, token_id: int = None) -> Optional[str]:
         """获取 reCAPTCHA token
 
         Args:
             project_id: Flow项目ID
+            token_id: Token ID，用于加载对应账号的浏览器Session
 
         Returns:
             reCAPTCHA token字符串，如果获取失败返回None
@@ -159,14 +161,55 @@ class BrowserCaptchaService:
         context = None
 
         try:
-            # 创建新的上下文
+            # 1. 尝试加载保存的登录状态 (如果存在)
+            # 使用 per-account session file
+            from .session_manager import get_session_manager
+            session_mgr = get_session_manager()
+            
+            if token_id:
+                auth_path = session_mgr.get_session_path(token_id)
+            else:
+                auth_path = "auth.json"  # Fallback for legacy calls
+            
+            load_state = auth_path if os.path.exists(auth_path) else None
+            if load_state:
+                debug_logger.log_info(f"[BrowserCaptcha] 发现 {auth_path}，将加载 Token {token_id} 的 Session...")
+            else:
+                debug_logger.log_info(f"[BrowserCaptcha] Token {token_id} 无已保存的 Session，需要手动登录")
+
+            # 创建新的上下文，使用与 API 请求一致的 User-Agent
             context = await self.browser.new_context(
+                storage_state=load_state,
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
                 locale='en-US',
-                timezone_id='America/New_York'
+                timezone_id='America/New_York',
+                extra_http_headers={
+                    "sec-ch-ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"'
+                }
             )
             page = await context.new_page()
+            
+            # 启用 stealth 模式规避检测
+            try:
+                from playwright_stealth.stealth import stealth_async
+                await stealth_async(page)
+                debug_logger.log_info("[BrowserCaptcha] Stealth 模式已启用")
+            except ImportError:
+                # Fallback for old versions or different structure
+                try:
+                    from playwright_stealth import stealth_async
+                    await stealth_async(page)
+                    debug_logger.log_info("[BrowserCaptcha] Stealth 模式已启用 (direct import)")
+                except:
+                     debug_logger.log_warning("[BrowserCaptcha] 无法加载 playwright-stealth，这可能导致被检测为机器人")
+
+            # 模拟一些随机行为
+            import random
+            await page.mouse.move(random.randint(100, 500), random.randint(100, 500))
+            await asyncio.sleep(random.uniform(1, 2))
 
             website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
 
@@ -180,31 +223,146 @@ class BrowserCaptchaService:
 
             # 检查并注入 reCAPTCHA v3 脚本
             debug_logger.log_info("[BrowserCaptcha] 检查并加载 reCAPTCHA v3 脚本...")
-            script_loaded = await page.evaluate("""
-                () => {
-                    if (window.grecaptcha && typeof window.grecaptcha.execute === 'function') {
-                        return true;
-                    }
-                    return false;
-                }
-            """)
+            
+            # --- Smart Login Check ---
+            # 检查是否已登录 (通过查找正向特征：头像、Google Account 元素)
+            is_logged_in = False
+            try:
+                debug_logger.log_info("[BrowserCaptcha] 正在检查登录状态 (Positive Check)...")
+                # 给一点时间渲染
+                await asyncio.sleep(5)
+                
+                # 正向检测：查找明确表示已登录的元素
+                # 1. 查找 aria-label 包含 "Google Account" 或 "Google 帐号" 的元素 (通常是头像按钮)
+                # 2. 查找 img 元素作为头像
+                login_indicator = await page.query_selector('button[aria-label*="Google Account"], button[aria-label*="Google 帐号"], img[src*="googleusercontent.com"]')
+                
+                if login_indicator:
+                     debug_logger.log_info(f"[BrowserCaptcha] 发现登录特征元素: {login_indicator}")
+                     is_logged_in = True
+                else:
+                     # 二次检查页面内容，防止 selector 漏掉
+                     # 只有同时满足 "没有Sign in" 且 "有特定的 Dashboard 关键词" 才敢认为是登录
+                     # 这里为了稳妥，如果找不到头像，就默认认为未登录，强制让用户确认
+                     debug_logger.log_info("[BrowserCaptcha] 未发现明确登录特征 (头像等)，将请求用户介入")
+                     is_logged_in = False
+                     
+            except Exception as e:
+                debug_logger.log_warning(f"[BrowserCaptcha] 登录检测异常: {e}")
+                is_logged_in = False
 
-            if not script_loaded:
-                # 注入脚本
-                debug_logger.log_info("[BrowserCaptcha] 注入 reCAPTCHA v3 脚本...")
-                await page.evaluate(f"""
-                    () => {{
-                        return new Promise((resolve) => {{
-                            const script = document.createElement('script');
-                            script.src = 'https://www.google.com/recaptcha/api.js?render={self.website_key}';
-                            script.async = true;
-                            script.defer = true;
-                            script.onload = () => resolve(true);
-                            script.onerror = () => resolve(false);
-                            document.head.appendChild(script);
-                        }});
-                    }}
-                """)
+            if is_logged_in:
+                debug_logger.log_info("[BrowserCaptcha] 检测到已登录状态，跳过手动登录等待。")
+                print("\n✅ 检测到已登录，继续执行...")
+                # 即使已登录，也可以顺手更新一下 auth.json (以防 cookie 包含新的字段)
+                try:
+                    storage = await context.storage_state()
+                    with open(auth_path, 'w', encoding='utf-8') as f:
+                        json.dump(storage, f, ensure_ascii=False, indent=2)
+                except:
+                    pass
+
+            else:
+                # --- Unlogged State: Force Manual Login ---
+                print("\n" + "="*50)
+                print("!!! 未检测到登录状态 !!!")
+                print("请在 300秒 (5分钟) 内完成以下操作：")
+                print("1. 点击右上角 'Sign in' 登录你的 Google 账号")
+                print("2. 确保页面显示你的头像 (已登录状态)")
+                print("3. 程序会自动保存你的登录状态到 auth.json")
+                print("="*50 + "\n")
+                
+                # 循环等待，每秒检查一次是否登录成功
+                for i in range(300):
+                    if i % 10 == 0:
+                        print(f"⏳ 请登录... 窗口将保持打开，剩余 {300-i} 秒")
+                    
+                    # --- Auto-Save Strategy: Every 5 seconds ---
+                    if i % 5 == 0:
+                        try:
+                             # 尝试保存当前状态 (防止用户强制退出导致未保存)
+                             temp_storage = await context.storage_state()
+                             abs_path = os.path.abspath(auth_path)
+                             with open(auth_path, 'w', encoding='utf-8') as f:
+                                 json.dump(temp_storage, f, ensure_ascii=False, indent=2)
+                             # print(f"[Debug] 自动保存成功: {abs_path}")
+                        except Exception as e:
+                             pass # print(f"❌ 自动保存失败: {e}")
+                    
+                    await asyncio.sleep(1)
+                    
+                    # 尝试检测登录状态
+                    try:
+                        # 1. UI检测: 头像
+                        login_indicator = await page.query_selector('img[src*="googleusercontent.com"], a[href*="accounts.google.com/SignOut"]')
+                        
+                        # 2. Cookie检测: 关键Auth Cookie
+                        cookies = await context.cookies()
+                        has_auth_cookie = any(c['name'] == '__Secure-3PSID' or c['name'] == 'SID' for c in cookies)
+                        
+                        if login_indicator or has_auth_cookie:
+                             print("\n✅ 检测到登录成功 (UI/Cookie)，已自动保存，继续...")
+                             break 
+                    except:
+                        pass
+                
+                # 循环结束后再次保存，确保最终状态
+                try:
+                    storage = await context.storage_state()
+                    with open(auth_path, 'w', encoding='utf-8') as f:
+                        json.dump(storage, f, ensure_ascii=False, indent=2)
+                    print(f"✅ 登录状态已保存到 {auth_path}")
+                except Exception as e:
+                     print(f"❌ 保存登录状态失败: {e}")
+            debug_logger.log_info("[BrowserCaptcha] 注入 reCAPTCHA v3 脚本 (with Trusted Types)...")
+            
+            await page.evaluate(f"""
+                () => {{
+                    return new Promise((resolve) => {{
+                        // 1. 尝试创建或获取 Trusted Types Policy
+                        let policy = null;
+                        if (window.trustedTypes && window.trustedTypes.createPolicy) {{
+                            try {{
+                                policy = window.trustedTypes.createPolicy('flow2api_policy', {{
+                                    createScriptURL: (string) => string,
+                                }});
+                            }} catch (e) {{
+                                // 如果策略已存在 (例如 'default')，可能无法创建新 policy，尝试直接使用字符串
+                                console.warn('Failed to create Trusted Type policy:', e);
+                            }}
+                        }}
+
+                        // 2. 准备 URL
+                        const url = 'https://www.google.com/recaptcha/api.js?render={self.website_key}';
+                        let trustedUrl = url;
+                        
+                        if (policy) {{
+                            trustedUrl = policy.createScriptURL(url);
+                        }}
+
+                        // 3. 创建并注入脚本
+                        const script = document.createElement('script');
+                        // 尝试赋值，如果失败则说明需要 policy 但创建失败
+                        try {{
+                            script.src = trustedUrl;
+                        }} catch (e) {{
+                            console.error('Failed to set script src:', e);
+                            resolve(false);
+                            return;
+                        }}
+                        
+                        script.async = true;
+                        script.defer = true;
+                        script.onload = () => resolve(true);
+                        script.onerror = (e) => {{
+                            console.error('Script load error:', e);
+                            resolve(false);
+                        }};
+                        document.head.appendChild(script);
+                    }});
+                }}
+            """)
+            debug_logger.log_info("[BrowserCaptcha] reCAPTCHA 脚本注入尝试完成")
 
             # 等待reCAPTCHA加载和初始化
             debug_logger.log_info("[BrowserCaptcha] 等待reCAPTCHA初始化...")
@@ -222,8 +380,11 @@ class BrowserCaptchaService:
             else:
                 debug_logger.log_warning("[BrowserCaptcha] reCAPTCHA 初始化超时，继续尝试执行...")
 
-            # 额外等待确保完全初始化
-            await page.wait_for_timeout(1000)
+            # 模拟人类滚动和停顿
+            await page.mouse.wheel(0, 500)
+            await asyncio.sleep(1)
+            await page.mouse.wheel(0, -200)
+            await asyncio.sleep(random.uniform(1, 3))
 
             # 执行reCAPTCHA并获取token
             debug_logger.log_info("[BrowserCaptcha] 执行reCAPTCHA验证...")
@@ -259,7 +420,7 @@ class BrowserCaptchaService:
 
                         // 执行reCAPTCHA v3
                         const token = await window.grecaptcha.execute(websiteKey, {
-                            action: 'FLOW_GENERATION'
+                            action: 'predict'
                         });
 
                         return token;
@@ -284,11 +445,13 @@ class BrowserCaptchaService:
             return None
         finally:
             # 关闭上下文
+            # debug模式下暂不关闭，由外部手动关闭
             if context:
-                try:
-                    await context.close()
-                except:
-                    pass
+                pass
+                # try:
+                #     await context.close()
+                # except:
+                #     pass
 
     async def close(self):
         """关闭浏览器"""

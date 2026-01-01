@@ -54,10 +54,20 @@ class FlowClient:
         if use_at and at_token:
             headers["authorization"] = f"Bearer {at_token}"
 
-        # 通用请求头
+        # 通用请求头 - 确保与浏览器一致
         headers.update({
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+            "sec-ch-ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-site",
+            "x-goog-api-client": "gl-js/ fire/10.1.0",
+            "Referer": "https://labs.google/",
+            "Origin": "https://labs.google",
+            "X-Goog-Authuser": "0"
         })
 
         # Log request
@@ -676,8 +686,8 @@ class FlowClient:
     # ========== 辅助方法 ==========
 
     def _generate_session_id(self) -> str:
-        """生成sessionId: ;timestamp"""
-        return f";{int(time.time() * 1000)}"
+        """生成sessionId: timestamp"""
+        return f"{int(time.time() * 1000)}"
 
     def _generate_scene_id(self) -> str:
         """生成sceneId: UUID"""
@@ -691,7 +701,9 @@ class FlowClient:
         if captcha_method == "browser":
             try:
                 from .browser_captcha import BrowserCaptchaService
-                service = await BrowserCaptchaService.get_instance(self.proxy_manager)
+                # 修复 Bug: BrowserCaptchaService 需要的是 Database 对象来获取配置，而不是 ProxyManager
+                db = self.proxy_manager.db
+                service = await BrowserCaptchaService.get_instance(db)
                 return await service.get_token(project_id)
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Browser] error: {str(e)}")

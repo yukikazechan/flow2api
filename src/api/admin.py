@@ -8,6 +8,7 @@ from ..core.auth import AuthManager
 from ..core.database import Database
 from ..services.token_manager import TokenManager
 from ..services.proxy_manager import ProxyManager
+from ..services.session_manager import get_session_manager
 
 router = APIRouter()
 
@@ -217,6 +218,17 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
             "video_count": stats.video_count if stats else 0,
             "error_count": stats.error_count if stats else 0
         })
+
+    # Add browser session status
+    session_mgr = get_session_manager()
+    for item in result:
+        token_id = item["id"]
+        session_status = session_mgr.get_session_status(token_id)
+        item["browser_session"] = {
+            "has_session": session_status["has_session"],
+            "needs_login": session_status["needs_login"],
+            "message": session_status["message"]
+        }
 
     return result  # 直接返回数组,兼容前端
 
@@ -878,3 +890,264 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "browser_proxy_enabled": captcha_config.browser_proxy_enabled,
         "browser_proxy_url": captcha_config.browser_proxy_url or ""
     }
+
+
+# ========== Browser Session Management ==========
+
+@router.get("/api/tokens/{token_id}/session-status")
+async def get_token_session_status(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """获取Token的浏览器Session状态"""
+    session_mgr = get_session_manager()
+    status = session_mgr.get_session_status(token_id)
+    return {
+        "success": True,
+        "token_id": token_id,
+        **status
+    }
+
+
+@router.post("/api/tokens/{token_id}/browser-login")
+async def trigger_browser_login(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """拉起可见浏览器让用户登录并保存Session（后台线程）"""
+    import threading
+    import os
+    import time
+    
+    # Get the token to find project_id
+    target_token = await token_manager.get_token(token_id)
+    if not target_token:
+        raise HTTPException(status_code=404, detail="Token不存在")
+    
+    project_id = target_token.current_project_id
+    if not project_id:
+        raise HTTPException(status_code=400, detail="Token没有关联的Project ID，无法拉起浏览器")
+    
+    # Get session manager
+    session_mgr = get_session_manager()
+    auth_path = session_mgr.get_session_path(token_id)
+    
+    # Define the background browser login function
+    def run_browser_login_sync():
+        import asyncio
+        asyncio.run(_browser_login_task(token_id, auth_path, session_mgr.SESSION_DIR))
+    
+    # Start background thread
+    thread = threading.Thread(target=run_browser_login_sync, daemon=True)
+    thread.start()
+    
+    return {
+        "success": True,
+        "message": "浏览器已拉起，请在浏览器窗口中完成登录。登录成功后Session将自动保存。",
+        "session_file": auth_path
+    }
+
+
+async def _browser_login_task(token_id: int, auth_path: str, session_dir: str):
+    """后台执行的浏览器登录任务"""
+    from playwright.async_api import async_playwright
+    import os
+    
+    try:
+        print(f"[BrowserLogin] 正在启动浏览器用于 Token {token_id}...")
+        
+        # Create a NEW visible browser instance
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=False,  # 显示浏览器窗口
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+            ]
+        )
+        
+        # Check if existing session exists
+        load_state = auth_path if os.path.exists(auth_path) else None
+        
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            storage_state=load_state
+        )
+        
+        page = await context.new_page()
+        
+        # Apply stealth with fallback
+        try:
+            from playwright_stealth.stealth import stealth_async
+            await stealth_async(page)
+            print("[BrowserLogin] Stealth 模式已启用")
+        except ImportError:
+            try:
+                from playwright_stealth import stealth_async
+                await stealth_async(page)
+                print("[BrowserLogin] Stealth 模式已启用 (direct import)")
+            except:
+                print("[BrowserLogin] 无法加载 playwright-stealth，继续执行...")
+        
+        # Navigate to Google accounts page
+        await page.goto("https://accounts.google.com")
+        
+        print(f"[BrowserLogin] 浏览器已打开，等待用户登录 Token {token_id}...")
+        print(f"[BrowserLogin] 登录成功后将保存到: {auth_path}")
+        
+        # Poll for login completion (max 300 seconds = 5 minutes)
+        login_detected = False
+        for _ in range(60):
+            await page.wait_for_timeout(5000)  # Wait 5 seconds
+            
+            # Save session periodically
+            os.makedirs(session_dir, exist_ok=True)
+            await context.storage_state(path=auth_path)
+            
+            # Check for login by looking for auth cookies
+            cookies = await context.cookies()
+            has_psid = any(c['name'] == '__Secure-3PSID' for c in cookies)
+            has_sid = any(c['name'] == 'SID' for c in cookies)
+            
+            if has_psid and has_sid:
+                login_detected = True
+                print(f"[BrowserLogin] ✅ 检测到登录成功！Session已保存到 {auth_path}")
+                break
+        
+        # Close browser
+        await browser.close()
+        await playwright.stop()
+        
+        if login_detected:
+            print(f"[BrowserLogin] ✅ Token {token_id} 登录完成")
+        else:
+            print(f"[BrowserLogin] ⚠️ Token {token_id} 登录超时或用户关闭了浏览器")
+            
+    except Exception as e:
+        print(f"[BrowserLogin] ❌ Token {token_id} 登录失败: {str(e)}")
+
+
+@router.post("/api/tokens/{token_id}/extract-st")
+async def extract_st_from_session(
+    token_id: int,
+    token: str = Depends(verify_admin_token)
+):
+    """从浏览器Session中自动提取ST并更新Token"""
+    import threading
+    import os
+    
+    # Get session manager
+    session_mgr = get_session_manager()
+    auth_path = session_mgr.get_session_path(token_id)
+    
+    # Check if session exists
+    if not os.path.exists(auth_path):
+        raise HTTPException(status_code=400, detail=f"Token {token_id} 没有保存的浏览器Session，请先点击登录")
+    
+    # Get the token
+    target_token = await token_manager.get_token(token_id)
+    if not target_token:
+        raise HTTPException(status_code=404, detail="Token不存在")
+    
+    # Define the background extraction function
+    def run_extract_st_sync():
+        import asyncio
+        asyncio.run(_extract_st_task(token_id, auth_path, target_token.current_project_id))
+    
+    # Start background thread
+    thread = threading.Thread(target=run_extract_st_sync, daemon=True)
+    thread.start()
+    
+    return {
+        "success": True,
+        "message": "正在从浏览器Session中提取ST，请查看服务器日志获取结果。",
+        "session_file": auth_path
+    }
+
+
+async def _extract_st_task(token_id: int, auth_path: str, project_id: str):
+    """后台执行的ST提取任务 - 自动打开浏览器获取ST并更新数据库"""
+    from playwright.async_api import async_playwright
+    import os
+    import json
+    
+    try:
+        print(f"[ExtractST] 正在从Session提取 Token {token_id} 的 ST...")
+        
+        # Create browser with saved session
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(
+            headless=False,  # 显示浏览器便于调试
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-dev-shm-usage',
+                '--no-sandbox',
+            ]
+        )
+        
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            storage_state=auth_path  # Load saved session
+        )
+        
+        page = await context.new_page()
+        
+        # Navigate to labs.google to trigger OAuth
+        print(f"[ExtractST] 打开 labs.google/fx/tools/flow...")
+        await page.goto("https://labs.google/fx/tools/flow")
+        
+        # Wait for page to load and potential OAuth redirects
+        await page.wait_for_timeout(8000)
+        
+        # Check current URL
+        current_url = page.url
+        print(f"[ExtractST] 当前页面: {current_url}")
+        
+        # Get all cookies from labs.google domain
+        cookies = await context.cookies(["https://labs.google"])
+        print(f"[ExtractST] labs.google 域名获取到 {len(cookies)} 个 cookies")
+        
+        # Print all cookie names for debugging
+        for c in cookies:
+            print(f"[ExtractST] Cookie: {c['name']}")
+        
+        # Look for session token cookie
+        st_value = None
+        for cookie in cookies:
+            if cookie['name'] == '__Secure-next-auth.session-token':
+                st_value = cookie['value']
+                print(f"[ExtractST] ✅ 找到 __Secure-next-auth.session-token!")
+                break
+        
+        # Save updated session
+        await context.storage_state(path=auth_path)
+        print(f"[ExtractST] Session 已更新保存到 {auth_path}")
+        
+        # Close browser
+        await browser.close()
+        await playwright.stop()
+        
+        if st_value:
+            print(f"[ExtractST] ✅ Token {token_id} ST 提取成功!")
+            print(f"[ExtractST] ST 值 (前50字符): {st_value[:50]}...")
+            
+            # TODO: Update database with new ST
+            # This would require injecting the token_manager or db dependency
+            # For now, just print the ST so user can copy it
+            print(f"[ExtractST] ========================================")
+            print(f"[ExtractST] 完整 ST 值:")
+            print(f"{st_value}")
+            print(f"[ExtractST] ========================================")
+            print(f"[ExtractST] 请手动复制上面的 ST 到 Token 编辑页面")
+        else:
+            print(f"[ExtractST] ⚠️ Token {token_id} 未能提取到 ST")
+            print(f"[ExtractST] 可能需要在浏览器中完成 labs.google 的 OAuth 授权")
+            
+    except Exception as e:
+        import traceback
+        print(f"[ExtractST] ❌ Token {token_id} ST 提取失败: {str(e)}")
+        traceback.print_exc()
+
+
+
