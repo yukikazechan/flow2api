@@ -60,18 +60,19 @@ class BrowserCaptchaService:
 
             debug_logger.log_info(f"[BrowserCaptcha] 正在启动浏览器 (用户数据目录: {self.user_data_dir})...")
 
-            # 清理可能存在的锁文件
-            lock_file = os.path.join(self.user_data_dir, "SingletonLock")
-            if os.path.exists(lock_file):
-                try:
-                    debug_logger.log_info(f"[BrowserCaptcha] 发现陈旧的锁文件，正在清理: {lock_file}")
-                    # SingletonLock 在 Linux 下通常是一个软链接
-                    if os.path.islink(lock_file):
-                        os.unlink(lock_file)
-                    else:
-                        os.remove(lock_file)
-                except Exception as e:
-                    debug_logger.log_warning(f"[BrowserCaptcha] 清理锁文件失败: {e}")
+            # 清理可能存在的锁文件（Linux下是符号链接，可能是断开的）
+            # 使用 lexists 而不是 exists，因为 exists 对断开的符号链接返回 False
+            lock_files = ["SingletonLock", "SingletonCookie", "SingletonSocket"]
+            for lock_name in lock_files:
+                lock_file = os.path.join(self.user_data_dir, lock_name)
+                # lexists 可以检测到断开的符号链接
+                if os.path.lexists(lock_file):
+                    try:
+                        debug_logger.log_info(f"[BrowserCaptcha] 发现锁文件，正在清理: {lock_file}")
+                        os.unlink(lock_file)  # unlink 适用于符号链接和普通文件
+                    except Exception as e:
+                        debug_logger.log_warning(f"[BrowserCaptcha] 清理锁文件失败: {e}")
+
 
             self.playwright = await async_playwright().start()
 
