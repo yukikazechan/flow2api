@@ -11,5 +11,5 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix
     environment:
       - PYTHONUNBUFFERED=1
-      - DISPLAY=:0
+      - DISPLAY=:10.0
     restart: unless-stopped
