@@ -1093,34 +1093,45 @@ async def _extract_st_task(token_id: int, auth_path: str, project_id: str):
         
         page = await context.new_page()
         
-        # Navigate to labs.google to trigger OAuth
+        # Navigate to labs.google
         print(f"[ExtractST] 打开 labs.google/fx/tools/flow...")
-        await page.goto("https://labs.google/fx/tools/flow")
+        await page.goto("https://labs.google/fx/tools/flow", timeout=60000)
         
-        # Wait for page to load and potential OAuth redirects
-        await page.wait_for_timeout(8000)
+        # Wait for page to load
+        await page.wait_for_timeout(3000)
         
-        # Check current URL
-        current_url = page.url
-        print(f"[ExtractST] 当前页面: {current_url}")
+        # Click "Create with Flow" button to trigger OAuth login
+        try:
+            create_button = page.get_by_text("Create with Flow")
+            if await create_button.is_visible():
+                print(f"[ExtractST] 点击 'Create with Flow' 按钮...")
+                await create_button.click()
+        except:
+            pass
         
-        # Get all cookies from labs.google domain
-        cookies = await context.cookies(["https://labs.google"])
-        print(f"[ExtractST] labs.google 域名获取到 {len(cookies)} 个 cookies")
-        
-        # Print all cookie names for debugging
-        for c in cookies:
-            print(f"[ExtractST] Cookie: {c['name']}")
-        
-        # Look for session token cookie
+        # Wait for OAuth to complete and session-token to appear (max 2 minutes)
+        print(f"[ExtractST] 等待登录完成 (最多120秒)...")
         st_value = None
-        for cookie in cookies:
-            if cookie['name'] == '__Secure-next-auth.session-token':
-                st_value = cookie['value']
-                print(f"[ExtractST] ✅ 找到 __Secure-next-auth.session-token!")
+        for i in range(24):  # 24 * 5s = 120 seconds
+            await page.wait_for_timeout(5000)
+            
+            # Check for session token cookie
+            cookies = await context.cookies(["https://labs.google"])
+            for cookie in cookies:
+                if cookie['name'] == '__Secure-next-auth.session-token':
+                    st_value = cookie['value']
+                    print(f"[ExtractST] ✅ 找到 session-token!")
+                    break
+            
+            if st_value:
                 break
+            
+            print(f"[ExtractST] 等待中... ({(i+1)*5}/120秒)")
+            
+            # Save session periodically
+            await context.storage_state(path=auth_path)
         
-        # Save updated session
+        # Save final session
         await context.storage_state(path=auth_path)
         print(f"[ExtractST] Session 已更新保存到 {auth_path}")
         
@@ -1130,16 +1141,29 @@ async def _extract_st_task(token_id: int, auth_path: str, project_id: str):
         
         if st_value:
             print(f"[ExtractST] ✅ Token {token_id} ST 提取成功!")
-            print(f"[ExtractST] ST 值 (前50字符): {st_value[:50]}...")
             
-            # TODO: Update database with new ST
-            # This would require injecting the token_manager or db dependency
-            # For now, just print the ST so user can copy it
-            print(f"[ExtractST] ========================================")
-            print(f"[ExtractST] 完整 ST 值:")
-            print(f"{st_value}")
-            print(f"[ExtractST] ========================================")
-            print(f"[ExtractST] 请手动复制上面的 ST 到 Token 编辑页面")
+            # Update database with new ST
+            try:
+                await db.update_token(token_id, st=st_value)
+                print(f"[ExtractST] ST已更新到数据库")
+                
+                # Refresh AT using new ST
+                result = await token_manager.flow_client.st_to_at(st_value)
+                new_at = result["access_token"]
+                expires = result.get("expires")
+                
+                from datetime import datetime
+                at_expires = None
+                if expires:
+                    try:
+                        at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
+                    except:
+                        pass
+                
+                await db.update_token(token_id, at=new_at, at_expires=at_expires)
+                print(f"[ExtractST] ✅ AT已刷新! 新过期时间: {at_expires}")
+            except Exception as e:
+                print(f"[ExtractST] ⚠️ 更新数据库失败: {e}")
         else:
             print(f"[ExtractST] ⚠️ Token {token_id} 未能提取到 ST")
             print(f"[ExtractST] 可能需要在浏览器中完成 labs.google 的 OAuth 授权")
