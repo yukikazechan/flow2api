@@ -7,6 +7,17 @@ from playwright.async_api import async_playwright, BrowserContext, Page
 
 from ..core.logger import debug_logger
 
+
+def validate_browser_proxy_url(proxy_url: str) -> tuple[bool, str]:
+    """验证浏览器代理URL格式"""
+    if not proxy_url:
+        return True, ""
+        
+    pattern = r'^(socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$'
+    if not re.match(pattern, proxy_url):
+        return False, "代理URL格式无效。正确格式: protocol://[user:pass@]host:port (支持 socks5/http/https)"
+    return True, ""
+
 def parse_proxy_url(proxy_url: str) -> Optional[Dict[str, str]]:
     """解析代理URL，分离协议、主机、端口、认证信息"""
     proxy_pattern = r'^(socks5|http|https)://(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$'

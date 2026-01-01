@@ -851,7 +851,7 @@ async def update_captcha_config(
     token: str = Depends(verify_admin_token)
 ):
     """Update captcha configuration"""
-    from ..services.browser_captcha import validate_browser_proxy_url
+    from ..services.browser_captcha_personal import validate_browser_proxy_url
 
     captcha_method = request.get("captcha_method")
     yescaptcha_api_key = request.get("yescaptcha_api_key")

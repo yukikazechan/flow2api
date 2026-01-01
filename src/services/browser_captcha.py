@@ -7,7 +7,10 @@ import time
 import re
 from typing import Optional, Dict
 from playwright.async_api import async_playwright, Browser, BrowserContext
-from playwright_stealth import stealth
+try:
+    from playwright_stealth import stealth
+except ImportError:
+    stealth = None
 
 from ..core.logger import debug_logger
 
@@ -193,18 +196,15 @@ class BrowserCaptchaService:
             page = await context.new_page()
             
             # 启用 stealth 模式规避检测
-            try:
-                from playwright_stealth.stealth import stealth_async
-                await stealth_async(page)
-                debug_logger.log_info("[BrowserCaptcha] Stealth 模式已启用")
-            except ImportError:
-                # Fallback for old versions or different structure
+            # 启用 stealth 模式规避检测
+            if stealth:
                 try:
-                    from playwright_stealth import stealth_async
-                    await stealth_async(page)
-                    debug_logger.log_info("[BrowserCaptcha] Stealth 模式已启用 (direct import)")
-                except:
-                     debug_logger.log_warning("[BrowserCaptcha] 无法加载 playwright-stealth，这可能导致被检测为机器人")
+                    await stealth(page)
+                    debug_logger.log_info("[BrowserCaptcha] Stealth 模式已启用")
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] Stealth 模式启用失败: {e}")
+            else:
+                debug_logger.log_warning("[BrowserCaptcha] playwright-stealth 未安装，无法启用隐身模式")
 
             # 模拟一些随机行为
             import random
