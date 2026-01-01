@@ -59,6 +59,20 @@ class BrowserCaptchaService:
                     proxy_url = captcha_config.browser_proxy_url
 
             debug_logger.log_info(f"[BrowserCaptcha] 正在启动浏览器 (用户数据目录: {self.user_data_dir})...")
+
+            # 清理可能存在的锁文件
+            lock_file = os.path.join(self.user_data_dir, "SingletonLock")
+            if os.path.exists(lock_file):
+                try:
+                    debug_logger.log_info(f"[BrowserCaptcha] 发现陈旧的锁文件，正在清理: {lock_file}")
+                    # SingletonLock 在 Linux 下通常是一个软链接
+                    if os.path.islink(lock_file):
+                        os.unlink(lock_file)
+                    else:
+                        os.remove(lock_file)
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] 清理锁文件失败: {e}")
+
             self.playwright = await async_playwright().start()
 
             # 配置启动参数
